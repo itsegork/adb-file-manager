@@ -10,24 +10,24 @@ GUI File Manager for Android devices using ADB (Android Debug Bridge).
 - Download files from Android to computer
 - Delete files on both computer and Android
 - Create folders on Android
-- Auto-refresh every 5 seconds
+- Auto-refresh after file operations (send, download, delete, create folder)
 - Context menu with different options for files and folders
-- Scrcpy integration for screen mirroring
+- Scrcpy integration with configuration dialog (audio/video settings, screen options)
 
 ## Requirements
 
 - Python 3.6+
 - ADB (android-tools)
 - tkinter (usually included with Python)
+- scrcpy
+- noto-fonts-emoji
 
 Optional:
 - scrcpy - for screen mirroring
 
 ## Build from GitHub (Arch Linux)
 - Install dependencies
-`sudo pacman -S python tk android-tools`
-    > Optional dependencies: 
-      `sudo pacman -S scrcpy`
+`sudo pacman -S python tk android-tools scrcpy noto-fonts-emoji`
 - Clone repository:
 `git clone https://github.com/itsegork/adb-file-manager.git`
 - Go to directory
