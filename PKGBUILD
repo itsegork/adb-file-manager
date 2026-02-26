@@ -1,10 +1,10 @@
 # Maintainer: Egor Kurochkin <itsegork@gmail.com>
 pkgname=adb-file-manager
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="GUI File Manager for Android devices using ADB"
 arch=('any')
-url="https://github.com/yourusername/adb-file-manager"
+url="https://github.com/itsegork/adb-file-manager"
 license=('MIT')
 depends=('python' 'android-tools' 'tk' 'scrcpy')
 makedepends=('python-setuptools')
