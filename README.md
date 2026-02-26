@@ -22,9 +22,6 @@ GUI File Manager for Android devices using ADB (Android Debug Bridge).
 - scrcpy
 - noto-fonts-emoji
 
-Optional:
-- scrcpy - for screen mirroring
-
 ## Build from GitHub (Arch Linux)
 - Install dependencies
 `sudo pacman -S python tk android-tools scrcpy noto-fonts-emoji`
