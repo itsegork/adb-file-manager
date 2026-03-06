@@ -19,7 +19,7 @@ class Config:
     LOG_HEIGHT = 8
     PROGRESS_LENGTH = 400
     GITHUB_REPO = "itsegork/adb-file-manager"
-    CURRENT_VERSION = "1.1.0"
+    CURRENT_VERSION = "2.0.0"
     
     class Messages:
         NO_DEVICE = "Нет подключенного устройства"
