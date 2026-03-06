@@ -32,6 +32,7 @@ GUI File Manager for Android devices using ADB (Android Debug Bridge).
 - tkinter (usually included with Python)
 - scrcpy
 - noto-fonts-emoji
+- python-requests
 
 ## Build from GitHub (Arch Linux)
 - Install dependencies
