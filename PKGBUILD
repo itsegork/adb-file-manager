@@ -7,7 +7,7 @@ arch=('any')
 url="https://github.com/itsegork/adb-file-manager"
 license=('MIT')
 depends=('python' 'android-tools' 'tk' 'scrcpy' 'noto-fonts-emoji')
-makedepends=('git', 'python-setuptools')
+makedepends=('git' 'python-setuptools')
 source=("$pkgname::git+https://github.com/itsegork/adb-file-manager.git")
 sha256sums=('SKIP')
 
