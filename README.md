@@ -36,7 +36,7 @@ GUI File Manager for Android devices using ADB (Android Debug Bridge).
 
 ## Build from GitHub (Arch Linux)
 - Install dependencies
-`sudo pacman -S python tk android-tools scrcpy noto-fonts-emoji`
+`sudo pacman -S python tk android-tools scrcpy noto-fonts-emoji python-requests`
 - Clone repository:
 `git clone https://github.com/itsegork/adb-file-manager.git`
 - Go to directory
