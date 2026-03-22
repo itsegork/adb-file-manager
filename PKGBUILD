@@ -1,6 +1,6 @@
 # Maintainer: Egor Kurochkin <itsegork@gmail.com>
 pkgname=adb-file-manager
-pkgver=prototype_3.0.0_build_22032026_1100
+pkgver=prealpha_3.0.0_build_22032026_2000
 pkgrel=1
 pkgdesc="GUI File Manager for Android devices using ADB"
 arch=('any')

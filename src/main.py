@@ -3,7 +3,9 @@ gi.require_version('Adw', '1')
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gdk', '4.0')
 gi.require_version('GdkPixbuf', '2.0')
-from gi.repository import Adw, Gtk, Gio, GLib, Gdk, GdkPixbuf
+gi.require_version('Pango', '1.0')
+from gi.repository import Pango
+from gi.repository import Adw, Gtk, Gio, GLib, Gdk, GdkPixbuf, Pango
 
 import os
 import threading
@@ -68,6 +70,8 @@ class ADBFileManager(Adw.Application):
             "scrcpy": lambda a, p: self._show_scrcpy_dialog(),
             "refresh": self._load_android_files,
             "mkdir": self._create_android_folder,
+            "install_apk": lambda a, p: self._select_apk_files(),        # новое
+            "send_files": lambda a, p: self._select_files_to_send(),    # новое
         }
         for name, callback in app_actions.items():
             action = Gio.SimpleAction.new(name, None)
@@ -95,7 +99,7 @@ class ADBFileManager(Adw.Application):
         self.window.set_default_size(*Config.WINDOW_SIZE)
         self.window.set_title("ADB File Manager")
 
-        # ---- Системный шрифт ----
+            # ---- Системный шрифт ----
         css_provider = Gtk.CssProvider()
         css_provider.load_from_data(b"""
         * {
@@ -116,10 +120,8 @@ class ADBFileManager(Adw.Application):
 
         # ---- Панель заголовка ----
         header = Adw.HeaderBar()
-        self.device_label = Gtk.Label(label="prototype_3.0.0_build_22032026_0720")
-        header.set_title_widget(self.device_label)
 
-        # Меню-гамбургер
+            # Меню-гамбургер
         menu_button = Gtk.MenuButton()
         menu = Gio.Menu()
         menu.append("Обновить", "app.refresh")
@@ -128,21 +130,11 @@ class ADBFileManager(Adw.Application):
         menu.append("Проверить обновления", "app.check-updates")
         menu.append("Scrcpy", "app.scrcpy")
         menu_button.set_menu_model(menu)
+        menu_button.set_icon_name("open-menu-symbolic")
+
         header.pack_end(menu_button)
 
         # Кнопки действий
-        install_btn = Gtk.Button.new_with_label("Установить APK")
-        install_btn.set_icon_name("package-x-generic")
-        install_btn.set_tooltip_text("Установить APK на устройство")
-        install_btn.connect("clicked", lambda b: self._select_apk_files())
-
-        send_btn = Gtk.Button.new_with_label("Отправить на Android")
-        send_btn.set_icon_name("drive-harddisk")
-        send_btn.set_tooltip_text("Отправить файлы на Android")
-        send_btn.connect("clicked", lambda b: self._select_files_to_send())
-
-        header.pack_start(install_btn)
-        header.pack_start(send_btn)
         main_box.append(header)
 
         # ---- Панель Android ----
@@ -156,17 +148,27 @@ class ADBFileManager(Adw.Application):
 
         # Заголовок панели с кнопками навигации
         android_header = Adw.HeaderBar()
-        android_header.set_title_widget(Gtk.Label(label="Android"))
+        self.android_panel_label = Gtk.Label(label="")
+        self.android_panel_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.android_panel_label.set_tooltip_text("Информация об устройстве")
+        android_header.set_title_widget(self.android_panel_label)
         android_header.set_show_end_title_buttons(False)
         android_header.set_show_start_title_buttons(False)
 
         up_btn = Gtk.Button.new_from_icon_name("go-up-symbolic")
         up_btn.set_tooltip_text("На уровень вверх (Backspace)")
         up_btn.connect("clicked", lambda b: self._android_navigate_up())
-
         home_btn = Gtk.Button.new_from_icon_name("go-home-symbolic")
         home_btn.set_tooltip_text("Домой (Home)")
         home_btn.connect("clicked", lambda b: self._android_go_home())
+
+        # Меню-кнопка с действиями
+        action_menu_button = Gtk.MenuButton()
+        action_menu = Gio.Menu()
+        action_menu.append("Установить APK", "app.install_apk")
+        action_menu.append("Отправить на Android", "app.send_files")
+        action_menu_button.set_menu_model(action_menu)
+        action_menu_button.set_tooltip_text("Действия")
 
         refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         refresh_btn.set_tooltip_text("Обновить (F5)")
@@ -174,6 +176,7 @@ class ADBFileManager(Adw.Application):
 
         android_header.pack_start(up_btn)
         android_header.pack_start(home_btn)
+        android_header.pack_start(action_menu_button)
         android_header.pack_end(refresh_btn)
 
         android_box.append(android_header)
@@ -336,7 +339,11 @@ class ADBFileManager(Adw.Application):
             f"{self.device_info.model} (Android {self.device_info.android_version}) | "
             f"{battery_text}{storage_text}"
         )
-        self.device_label.set_label(info_text)
+        # Обновляем метку в панели Android
+        if hasattr(self, 'android_panel_label'):
+            self.android_panel_label.set_text(info_text)
+            # Добавим подсказку
+            self.android_panel_label.set_tooltip_text(info_text)
 
     def _start_device_info_updater(self):
         def update():
