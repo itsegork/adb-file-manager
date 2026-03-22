@@ -3,11 +3,10 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Config:
     ANDROID_HOME = "/storage/emulated/0"
-    WINDOW_SIZE = "1200x800"
-    LOG_HEIGHT = 8
-    PROGRESS_LENGTH = 400
+    WINDOW_SIZE = (1200, 800)
     GITHUB_REPO = "itsegork/adb-file-manager"
-    CURRENT_VERSION = "2.0.2"
+    CURRENT_VERSION = "prototype_3.0.0_build_22032026_1100"
+    
 
     class Messages:
         NO_DEVICE = "Нет подключенного устройства"
