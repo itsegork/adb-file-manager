@@ -271,19 +271,12 @@ class ADBHelper:
         except subprocess.SubprocessError:
             return False
 
-    def pull_file(self, remote_path: str, local_dir: str) -> bool:
-        if not self.device:
-            return False
-        try:
-            result = subprocess.run(
-                ["adb", "-s", self.device, "pull", remote_path, local_dir],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            return result.returncode == 0
-        except subprocess.SubprocessError:
-            return False
+    def pull_file(self, remote_path, local_path):
+        return subprocess.Popen(
+            ["adb", "-s", self.device, "pull", remote_path, local_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
     def delete_file(self, remote_path: str) -> bool:
         if not self.device:
@@ -367,3 +360,69 @@ class ADBHelper:
             return False, "Таймаут при установке"
         except Exception as e:
             return False, str(e)
+        
+    def get_file_size(self, remote_path: str) -> int:
+        """
+        Считает суммарный размер всех файлов в папке (рекурсивно) через adb.
+        Возвращает размер в байтах.
+        """
+        import subprocess
+
+        total = 0
+        try:
+            # Получаем список всех файлов с полными путями
+            cmd = f'adb -s {self.device} shell "find \\"{remote_path}\\" -type f"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            files = result.stdout.strip().splitlines()
+            for f in files:
+                # Получаем размер каждого файла
+                size_cmd = f'adb -s {self.device} shell "stat -c %s \\"{f}\\" "'
+                size_result = subprocess.run(size_cmd, shell=True, capture_output=True, text=True)
+                s = size_result.stdout.strip()
+                if s.isdigit():
+                    total += int(s)
+        except Exception:
+            pass
+        return total
+    
+    def get_directory_size(self, path: str) -> int:
+        """Получает размер папки с помощью du -sh для быстрого подсчёта"""
+        from utils import parse_size
+        output = self._run_shell(f"du -sh '{path}'")
+        if output:
+            parts = output.split()
+            if parts:
+                size_str = parts[0]
+                return parse_size(size_str)
+        return 0
+    
+    def is_directory(self, path: str) -> bool:
+        """Возвращает True, если путь на устройстве — папка"""
+        result, _ = self.run_command(f'shell [ -d "{path}" ] && echo 1 || echo 0')
+        return result.strip() == "1"
+    
+    def list_all_files(self, folder: str) -> List[str]:
+        """Возвращает список всех файлов (с полными путями) внутри папки"""
+        files = []
+        def walk(remote_path):
+            entries = self.list_files(remote_path)  # твой существующий метод, который возвращает FileInfo[]
+            for f in entries:
+                full_path = f"{remote_path.rstrip('/')}/{f.name}"
+                if f.is_dir:
+                    walk(full_path)
+                else:
+                    files.append(full_path)
+        walk(folder)
+        return files
+    
+    def get_total_size(self, remote_path: str) -> int:
+        """
+        Возвращает размер файла или папки в байтах рекурсивно.
+        """
+        if self.is_directory(remote_path):
+            total = 0
+            for f in self.list_files(remote_path):
+                total += self.get_total_size(f"{remote_path.rstrip('/')}/{f.name}")
+            return total
+        else:
+            return self.get_file_size(remote_path)

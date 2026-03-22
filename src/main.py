@@ -1,5 +1,9 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+#!/usr/bin/env python3
+import gi
+gi.require_version('Adw', '1')
+gi.require_version('Gtk', '4.0')
+from gi.repository import Adw, Gtk, Gio, GLib, Gdk
+
 import os
 import threading
 from pathlib import Path
@@ -8,6 +12,7 @@ import webbrowser
 import subprocess
 from typing import List, Optional
 from datetime import datetime
+import time
 
 import requests
 
@@ -19,308 +24,385 @@ from info_window import InfoWindow
 from utils import normalize_android_path, format_size
 
 
-class ADBFileManager:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("ADB File Manager")
-        self.root.geometry(Config.WINDOW_SIZE)
-
+class ADBFileManager(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="ru.github.itsegork.adbfilemanager",
+                         flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.adb = ADBHelper()
         self.current_android_path = Config.ANDROID_HOME
         self.current_local_path = str(Path.home())
         self.device_info = DeviceInfo()
+        self.log_buffer = None
+        self.window = None
+        self.progress_bar = None
+        self.progress_label = None
+        self.log_textview = None
+        self._context_selection = None   # для хранения выбранного элемента в контекстном меню
 
+    def do_activate(self):
         if not self.adb.check_adb():
-            messagebox.showerror("Ошибка", Config.Messages.NO_ADB)
-            self.root.quit()
+            dialog = Adw.MessageDialog.new(
+                self.window, "Ошибка", Config.Messages.NO_ADB
+            )
+            dialog.add_response("ok", "OK")
+            dialog.present()
+            self.quit()
             return
 
-        self._setup_ui()
-        self._connect_device()
-        self._check_for_updates()
-        self._start_device_info_updater()
+        self.window = Adw.ApplicationWindow(application=self)
+        self.window.set_default_size(*Config.WINDOW_SIZE)
+        self.window.set_title("ADB File Manager")
 
-    def _setup_ui(self):
-        top_frame = ttk.Frame(self.root, padding="10")
-        top_frame.pack(fill=tk.X)
-
-        info_frame = ttk.LabelFrame(top_frame, text="Информация об устройстве", padding="5")
-        info_frame.pack(fill=tk.X, pady=(0, 10))
-
-        self.device_info_label = ttk.Label(
-            info_frame,
-            text="Устройство: не подключено",
-            wraplength=800
+        # ---------------- Системный шрифт ----------------
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(b"""
+        * {
+            font-family: system-ui;
+        }
+        """)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
-        self.device_info_label.pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(
-            info_frame,
-            text="ℹ️ О программе",
-            command=self._show_info_window
-        ).pack(side=tk.RIGHT, padx=5)
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.window.set_content(main_box)
 
-        ttk.Button(
-            info_frame,
-            text="🖥️ Scrcpy",
-            command=self._show_scrcpy_dialog
-        ).pack(side=tk.RIGHT, padx=5)
+        # ---------------- Header ----------------
+        info_bar = Adw.HeaderBar()
+        self.device_label = Gtk.Label(label="Устройство: не подключено")
+        info_bar.set_title_widget(self.device_label)
 
-        ttk.Button(
-            info_frame,
-            text="🔄 Проверить обновления",
-            command=self._check_for_updates
-        ).pack(side=tk.RIGHT, padx=5)
+        menu_button = Gtk.MenuButton()
+        menu = Gio.Menu()
+        menu.append("О программе", "app.about")
+        menu.append("Проверить обновления", "app.check-updates")
+        menu.append("Scrcpy", "app.scrcpy")
+        menu_button.set_menu_model(menu)
+        info_bar.pack_end(menu_button)
+        main_box.append(info_bar)
 
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # ---------------- Кнопки управления файлами ----------------
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        install_btn = Gtk.Button.new_with_label("Установить APK")
+        install_btn.connect("clicked", lambda b: self._select_apk_files())
+        send_btn = Gtk.Button.new_with_label("Отправить на Android")
+        send_btn.connect("clicked", lambda b: self._select_files_to_send())
+        button_box.append(install_btn)
+        button_box.append(send_btn)
+        main_box.append(button_box)
 
-        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
-
-        left_frame = ttk.Frame(paned)
-        paned.add(left_frame, weight=1)
-
-        self.local_view = FileTreeView(
-            left_frame,
-            "Локальные файлы (компьютер)",
-            self._on_local_double_click,
-            self._show_local_context_menu
-        )
-        self.local_view.path_label.config(text=self.current_local_path)
-
-        right_frame = ttk.Frame(paned)
-        paned.add(right_frame, weight=1)
-
+        # ---------------- Панель Android ----------------
         self.android_view = FileTreeView(
-            right_frame,
-            "Файлы Android",
+            "Android",
             self._on_android_double_click,
             self._show_android_context_menu
         )
-        self.android_view.path_label.config(text=self.current_android_path)
+        main_box.append(self.android_view.widget)
 
-        self._setup_progress_bar(main_frame)
+        # ---------------- Прогресс и лог ----------------
+        bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        main_box.append(bottom_box)
 
-        bottom_frame = ttk.Frame(self.root, padding="10")
-        bottom_frame.pack(fill=tk.BOTH, expand=True)
+        progress_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.progress_label = Gtk.Label(label="")
+        self.progress_bar = Gtk.ProgressBar()
+        progress_box.append(self.progress_label)
+        progress_box.append(self.progress_bar)
+        bottom_box.append(progress_box)
 
-        cmd_frame = ttk.LabelFrame(bottom_frame, text="ADB команда", padding="5")
-        cmd_frame.pack(fill=tk.X, pady=(0, 10))
+        log_frame = Gtk.Frame()
+        log_frame.set_label("Лог операций")
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        self.log_textview = Gtk.TextView()
+        self.log_textview.set_editable(False)
+        self.log_buffer = self.log_textview.get_buffer()
+        scrolled.set_child(self.log_textview)
+        log_frame.set_child(scrolled)
+        bottom_box.append(log_frame)
 
-        cmd_input_frame = ttk.Frame(cmd_frame)
-        cmd_input_frame.pack(fill=tk.X)
+        # Кнопки управления логом
+        log_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        clear_btn = Gtk.Button.new_with_label("Очистить лог")
+        clear_btn.connect("clicked", self.clear_log)
+        copy_btn = Gtk.Button.new_with_label("Копировать всё")
+        copy_btn.connect("clicked", self.copy_log_to_clipboard)
+        save_btn = Gtk.Button.new_with_label("Сохранить лог")
+        save_btn.connect("clicked", self.save_log_to_file)
+        log_buttons.append(clear_btn)
+        log_buttons.append(copy_btn)
+        log_buttons.append(save_btn)
+        bottom_box.append(log_buttons)
 
-        self.adb_command = ttk.Entry(cmd_input_frame)
-        self.adb_command.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        self.adb_command.bind("<Return>", lambda e: self._execute_adb_command())
-        self.adb_command.insert(0, "Введите команду (например: shell ls /sdcard, clear)")
-        self.adb_command.bind("<FocusIn>", self._on_adb_command_focus_in)
-        self.adb_command.bind("<FocusOut>", self._on_adb_command_focus_out)
+        # Нижняя строка для ADB команды
+        cmd_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.cmd_entry = Gtk.Entry()
+        self.cmd_entry.set_placeholder_text("Введите ADB команду (например: shell ls /sdcard)")
+        self.cmd_entry.connect("activate", lambda e: self._execute_adb_command())
+        cmd_box.append(self.cmd_entry)
+        exec_btn = Gtk.Button.new_with_label("Выполнить")
+        exec_btn.connect("clicked", lambda b: self._execute_adb_command())
+        cmd_box.append(exec_btn)
+        bottom_box.append(cmd_box)
 
-        ttk.Button(
-            cmd_input_frame,
-            text="Выполнить",
-            command=self._execute_adb_command
-        ).pack(side=tk.RIGHT)
+        self.window.present()
 
-        self._setup_log(bottom_frame)
+        # Подключение устройства
+        self._connect_device()
+        self._check_for_updates()
+        self._start_device_info_updater()
+        self._setup_context_actions()
 
-        self._load_local_files()
+    def _setup_context_actions(self):
+        # Локальные действия
+        local_actions = {
+            "local.open": self._local_open,
+            "local.refresh": lambda: self._load_local_files(),
+            "local.rename": self._rename_local_item,
+            "local.install": lambda: self._install_single_apk(self._context_selection[0][1] if self._context_selection else ""),
+            "local.send": self._send_files,
+            "local.delete": self._delete_local_files,
+        }
+        for name, callback in local_actions.items():
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda a, p, cb=callback: cb())
+            self.add_action(action)
 
-    def _setup_progress_bar(self, parent):
-        self.progress_frame = ttk.Frame(parent)
-        self.progress_frame.pack(fill=tk.X, pady=(10, 0))
+        # Android действия
+        android_actions = {
+            "android.open": self._android_open,
+            "android.pull": self._pull_files,
+            "android.rename": self._rename_android_item,
+            "android.delete": self._delete_android_files,
+            "android.mkdir": self._create_android_folder,
+            "android.refresh": self._load_android_files,
+            "android.install": self._install_apk_from_device,
+        }
+        for name, callback in android_actions.items():
+            action = Gio.SimpleAction.new(name, None)
+            if name == "android.install":
+                action.connect("activate", lambda a, p, cb=callback: cb(self._context_selection[0][1] if self._context_selection else ""))
+            else:
+                action.connect("activate", lambda a, p, cb=callback: cb())
+            self.add_action(action)
 
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            self.progress_frame,
-            variable=self.progress_var,
-            maximum=100,
-            length=Config.PROGRESS_LENGTH
-        )
-        self.progress_label = ttk.Label(self.progress_frame, text="")
-
-    def _setup_log(self, parent):
-        log_frame = ttk.LabelFrame(parent, text="Лог операций", padding="5")
-        log_frame.pack(fill=tk.BOTH, expand=True)
-
-        log_control_frame = ttk.Frame(log_frame)
-        log_control_frame.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Button(
-            log_control_frame,
-            text="🗑️ Очистить лог",
-            command=self.clear_log
-        ).pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(
-            log_control_frame,
-            text="📋 Копировать всё",
-            command=self.copy_log_to_clipboard
-        ).pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(
-            log_control_frame,
-            text="💾 Сохранить лог",
-            command=self.save_log_to_file
-        ).pack(side=tk.LEFT, padx=5)
-
-        text_scroll_frame = ttk.Frame(log_frame)
-        text_scroll_frame.pack(fill=tk.BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(text_scroll_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.log_text = tk.Text(
-            text_scroll_frame,
-            height=Config.LOG_HEIGHT,
-            yscrollcommand=scrollbar.set,
-            wrap=tk.WORD
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.log_text.yview)
-
-        self.log_text.tag_configure("error", foreground="red")
-        self.log_text.tag_configure("success", foreground="green")
-        self.log_text.tag_configure("warning", foreground="orange")
-        self.log_text.tag_configure("info", foreground="blue")
-        self.log_text.tag_configure("command", foreground="purple")
-
-        self.log_text.bind("<Button-3>", self._show_log_context_menu)
+        # Действия для верхнего меню
+        app_actions = {
+            "about": self._show_info_window,
+            "check-updates": lambda a, p: self._check_for_updates(),
+            "scrcpy": lambda a, p: self._show_scrcpy_dialog(),
+        }
+        for name, callback in app_actions.items():
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            self.add_action(action)
 
     def _connect_device(self):
-        try:
-            devices = self.adb.get_devices()
-            if not devices:
-                messagebox.showwarning("Внимание", Config.Messages.NO_DEVICE)
-                return
+        devices = self.adb.get_devices()
+        if not devices:
+            dialog = Adw.MessageDialog.new(
+                self.window, "Внимание", Config.Messages.NO_DEVICE
+            )
+            dialog.add_response("ok", "OK")
+            dialog.present()
+            return
 
-            if len(devices) == 1:
-                self.adb.device = devices[0]
-            else:
-                self._show_device_selection_dialog(devices)
+        if len(devices) == 1:
+            self.adb.device = devices[0]
+        else:
+            self._show_device_selection_dialog(devices)
 
-            if self.adb.device:
+        if self.adb.device:
+            self._update_device_info()
+            self.log("Подключено к устройству", "success")
+            self._load_android_files()
+
+    def _show_device_selection_dialog(self, devices: List[str]):
+        dialog = Adw.MessageDialog.new(self.window, "Выбор устройства", "Выберите устройство:")
+        listbox = Gtk.ListBox()
+        for dev in devices:
+            model = self.adb.get_device_model(dev)
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=f"{model} ({dev})")
+            row.set_child(label)
+            listbox.append(row)
+        dialog.set_extra_child(listbox)
+        dialog.add_response("cancel", "Отмена")
+        dialog.add_response("select", "Выбрать")
+        dialog.set_response_appearance("select", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda d, resp: self._on_device_selected(d, resp, devices, listbox))
+        dialog.present()
+
+    def _on_device_selected(self, dialog, response, devices, listbox):
+        if response == "select":
+            row = listbox.get_selected_row()
+            if row:
+                idx = row.get_index()
+                self.adb.device = devices[idx]
                 self._update_device_info()
-                self.log("✓ Подключено к устройству", "success")
                 self._load_android_files()
-
-        except Exception as e:
-            self.log(f"✗ Ошибка при подключении: {e}", "error")
+        dialog.destroy()
 
     def _update_device_info(self):
         if not self.adb.device:
             return
-
         self.device_info = self.adb.get_device_info()
 
+        # Батарея текстом
         if self.device_info.battery_status == "зарядка":
-            battery_icon = "⚡"
-        elif self.device_info.battery_level > 80:
-            battery_icon = "🔋"
-        elif self.device_info.battery_level > 20:
-            battery_icon = "🔋"
+            battery_text = f"Батарея: {self.device_info.battery_level}% (зарядка)"
         else:
-            battery_icon = "⚠️"
-
-        temp_info = ""
+            battery_text = f"Батарея: {self.device_info.battery_level}%"
         if self.device_info.battery_temperature > 0:
-            temp_info = f" {self.device_info.battery_temperature:.1f}°C"
-
-        health_info = ""
+            battery_text += f", {self.device_info.battery_temperature:.1f}°C"
         if self.device_info.battery_health and self.device_info.battery_health != "хорошее":
-            health_info = f" [{self.device_info.battery_health}]"
+            battery_text += f" [{self.device_info.battery_health}]"
 
-        storage_info = ""
+        # Память
+        storage_text = ""
         if self.device_info.free_storage and self.device_info.total_storage:
-            storage_info = f"💾 Свободно: {self.device_info.free_storage} / Всего: {self.device_info.total_storage}"
-        else:
-            storage_info = "💾 Информация о памяти недоступна"
+            storage_text = f" | Свободно: {self.device_info.free_storage} / Всего: {self.device_info.total_storage}"
+        elif self.device_info.free_storage:
+            storage_text = f" | Свободно: {self.device_info.free_storage}"
+        elif self.device_info.total_storage:
+            storage_text = f" | Всего: {self.device_info.total_storage}"
 
         info_text = (
-            f"📱 {self.device_info.model} (Android {self.device_info.android_version}) | "
-            f"{battery_icon} {self.device_info.battery_level}% ({self.device_info.battery_status}{temp_info}{health_info}) | "
-            f"{storage_info}"
+            f"{self.device_info.model} (Android {self.device_info.android_version}) | "
+            f"{battery_text}{storage_text}"
         )
-        self.device_info_label.config(text=info_text)
+        self.device_label.set_label(info_text)
 
     def _start_device_info_updater(self):
         def update():
             if self.adb.device:
                 self._update_device_info()
-            self.root.after(30000, update)
+            GLib.timeout_add_seconds(30, update)
+        GLib.timeout_add_seconds(30, update)
 
-        self.root.after(30000, update)
+    def _select_apk_files(self):
+        dialog = Gtk.FileChooserNative.new(
+            "Выберите APK для установки",
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            "Выбрать",
+            "Отмена"
+        )
+        dialog.set_select_multiple(True)
+        dialog.connect("response", self._on_apk_files_selected)
+        dialog.show()
 
-    def _show_device_selection_dialog(self, devices: List[str]):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Выбор устройства")
-        dialog.geometry("500x300")
-        dialog.transient(self.root)
-        dialog.grab_set()
+    def _on_apk_files_selected(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            files = [f.get_path() for f in dialog.get_files()]
+            if files:
+                threading.Thread(target=self._install_apks_thread, args=(files,), daemon=True).start()
+        dialog.destroy()
 
-        ttk.Label(dialog, text="Выберите устройство:").pack(pady=10)
+    def _select_files_to_send(self):
+        dialog = Gtk.FileChooserNative.new(
+            "Выберите файлы для отправки на Android",
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            "Выбрать",
+            "Отмена"
+        )
+        dialog.set_select_multiple(True)
+        dialog.connect("response", self._on_files_to_send_selected)
+        dialog.show()
 
-        listbox = tk.Listbox(dialog)
-        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+    def _on_files_to_send_selected(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            files = [f.get_path() for f in dialog.get_files()]
+            if files:
+                self._send_files_from_drop(files)
+        dialog.destroy()
 
-        for dev in devices:
-            model = self.adb.get_device_model(dev)
-            listbox.insert(tk.END, f"{model} ({dev})")
+    def _pull_files(self):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        selection = self.android_view.get_selection()
+        files = [name for is_dir, name in selection]
+        if not files:
+            self.log("Выберите файлы для скачивания", "warning")
+            return
 
-        def select():
-            selection = listbox.curselection()
-            if selection:
-                self.adb.device = devices[selection[0]]
-                dialog.destroy()
-                self._update_device_info()
-                self._load_android_files()
+        # Открываем системный диалог выбора папки
+        dialog = Gtk.FileChooserNative.new(
+            "Выберите папку для сохранения",
+            self.window,
+            Gtk.FileChooserAction.SELECT_FOLDER,
+            "Выбрать",
+            "Отмена"
+        )
+        dialog.connect("response", lambda d, resp: self._on_save_folder_selected(d, resp, files))
+        dialog.show()
 
-        ttk.Button(dialog, text="Выбрать", command=select).pack(pady=10)
+    def _on_save_folder_selected(self, dialog, response, files):
+        if response == Gtk.ResponseType.ACCEPT:
+            folder = dialog.get_file().get_path()
+            threading.Thread(target=self._pull_files_thread, args=(files, folder), daemon=True).start()
+        dialog.destroy()
 
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
+    def _pull_files_thread(self, files: list, local_folder: str):
+        self._show_progress(True, "Скачивание файлов...")
+        total_size = 0
+        sizes = {}
 
-    def _load_local_files(self, path: Optional[str] = None):
-        if path:
-            self.current_local_path = path
+        # Сначала считаем общий размер
+        def compute_size(remote_path):
+            try:
+                if self.adb.is_directory(remote_path):
+                    size = self.adb.get_directory_size(remote_path)
+                    sizes[remote_path] = size
+                    return size
+                else:
+                    size = self.adb.get_file_size(remote_path)
+                    sizes[remote_path] = size
+                    return size
+            except Exception:
+                return 0
 
-        self.local_view.clear()
+        for f in files:
+            remote_path = f"{self.current_android_path.rstrip('/')}/{f}"
+            total_size += compute_size(remote_path)
 
-        try:
-            if self.current_local_path != "/" and os.path.exists(os.path.dirname(self.current_local_path)):
-                self.local_view.add_parent_item()
+        self._show_progress(True, f"Скачивание файлов ({format_size(total_size)})...")
+        downloaded = 0
 
-            files = []
-            for item in os.listdir(self.current_local_path):
-                full_path = os.path.join(self.current_local_path, item)
-                try:
-                    stat = os.stat(full_path)
-                    is_dir = os.path.isdir(full_path)
+        def pull_path(remote_path, local_base):
+            nonlocal downloaded
+            try:
+                if self.adb.is_directory(remote_path):
+                    folder_name = os.path.basename(remote_path)
+                    local_folder_path = os.path.join(local_base, folder_name)
+                    os.makedirs(local_folder_path, exist_ok=True)
+                    for f in self.adb.list_files(remote_path):
+                        pull_path(f"{remote_path.rstrip('/')}/{f.name}", local_folder_path)
+                else:
+                    filename = os.path.basename(remote_path)
+                    success = self.adb.pull_file(remote_path, local_base)
+                    if success:
+                        file_size = self.adb.get_file_size(remote_path)  # получаем размер реально скачанного файла
+                        downloaded += file_size
+                        GLib.idle_add(lambda f=filename: self.log(f"{f} скачан", "success"))
+                        GLib.idle_add(lambda d=downloaded, t=total_size: self._update_progress(
+                            d / t * 100,
+                            f"Скачивание... ({format_size(d)} / {format_size(t)})"
+                        ))
+                    else:
+                        GLib.idle_add(lambda f=filename: self.log(f"Ошибка при скачивании {f}", "error"))
+            except Exception as e:
+                GLib.idle_add(lambda f=remote_path, err=e: self.log(f"Ошибка при скачивании {f}: {err}", "error"))
 
-                    file_info = FileInfo(
-                        name=item,
-                        path=full_path,
-                        size=format_size(stat.st_size) if not is_dir else "",
-                        modified=datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-                        is_dir=is_dir
-                    )
-                    files.append(file_info)
-                except (OSError, PermissionError):
-                    continue
+        for f in files:
+            remote_path = f"{self.current_android_path.rstrip('/')}/{f}"
+            pull_path(remote_path, local_folder)
 
-            files.sort(key=lambda x: (not x.is_dir, x.name.lower()))
-
-            for file_info in files:
-                self.local_view.add_file(file_info, file_info.path)
-
-            self.local_view.path_label.config(text=self.current_local_path)
-
-        except Exception as e:
-            self.log(f"✗ Ошибка при загрузке локальных файлов: {e}", "error")
+        GLib.idle_add(self._show_progress, False)
 
     def _load_android_files(self):
         if not self.adb.device:
@@ -330,72 +412,354 @@ class ADBFileManager:
     def _load_android_files_thread(self):
         try:
             current_path = self.current_android_path
-            self.root.after(0, lambda: self.log(f"📂 Загрузка файлов из {current_path}...", "info"))
-
+            GLib.idle_add(lambda: self.log(f"Загрузка файлов из {current_path}...", "info"))
             if not self.adb.check_directory_access(current_path):
-                self.root.after(0, lambda: self.log(f"⚠ Нет доступа к {current_path}", "warning"))
-                self.root.after(0, lambda: self._update_android_tree([]))
+                GLib.idle_add(lambda: self.log(f"Нет доступа к {current_path}", "warning"))
+                GLib.idle_add(lambda: self._update_android_tree([]))
                 return
-
             files = self.adb.list_files(current_path)
             files = [f for f in files if f.name and f.name.strip()]
 
-            self.root.after(0, lambda: self._update_android_tree(files))
-
+            GLib.idle_add(lambda: self._update_android_tree(files))
             if not files:
-                self.root.after(0, lambda: self.log("⚠ Папка пуста или нет доступа", "warning"))
+                GLib.idle_add(lambda: self.log("Папка пуста или нет доступа", "warning"))
             else:
                 dirs = len([f for f in files if f.is_dir])
                 f_count = len([f for f in files if not f.is_dir])
-                self.root.after(0, lambda: self.log(f"✓ Загружено: {dirs} папок, {f_count} файлов", "success"))
-
+                GLib.idle_add(lambda: self.log(f"Загружено: {dirs} папок, {f_count} файлов", "success"))
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"✗ Ошибка при загрузке Android файлов: {e}", "error"))
-            self.root.after(0, lambda: self._update_android_tree([]))
+            GLib.idle_add(lambda: self.log(f"Ошибка при загрузке Android файлов: {e}", "error"))
+            GLib.idle_add(lambda: self._update_android_tree([]))
 
     def _update_android_tree(self, files: List[FileInfo]):
         self.android_view.clear()
         files.sort(key=lambda x: (not x.is_dir, x.name.lower()))
-
         for file_info in files:
             if not file_info.name:
                 continue
             self.android_view.add_file(file_info, file_info.name)
-
         display_path = self.current_android_path
         if len(display_path) > 50:
             parts = display_path.split('/')
             if len(parts) > 3:
                 display_path = f".../{'/'.join(parts[-3:])}"
-        self.android_view.path_label.config(text=display_path)
+        self.android_view.set_path(display_path)
 
-    def _on_local_double_click(self, event):
-        if event == "up":
-            self._local_navigate_up()
-        elif event == "home":
-            self._local_go_home()
-        elif event is None:
-            self._load_local_files()
-        else:
-            selection = self.local_view.get_selection()
-            if selection and selection[0][0] == "dir":
-                self._load_local_files(selection[0][1])
-
-    def _on_android_double_click(self, event):
+    def _on_android_double_click(self, event, data=None):
         if event == "up":
             self._android_navigate_up()
         elif event == "home":
             self._android_go_home()
+        elif event == "drop":
+            if data:
+                self._send_files_from_drop(data)
         elif event is None:
             self._load_android_files()
+        elif isinstance(event, str):
+            folder_name = event.strip('\'"').strip()
+            current = self.current_android_path.rstrip('/')
+            new_path = f"/{folder_name}" if current == "/" else f"{current}/{folder_name}"
+            self.current_android_path = normalize_android_path(new_path)
+            self._load_android_files()
+
+    def _send_files_from_drop(self, paths: List[str]):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        self._ask_yes_no("Подтверждение", f"Отправить {len(paths)} файл(ов)?",
+                         lambda: threading.Thread(target=self._send_files_thread, args=(paths,), daemon=True).start())
+
+    def _send_files(self):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        selection = self.local_view.get_selection()
+        files = [path for is_dir, path in selection if path != "parent"]
+        if not files:
+            self.log("Выберите файлы для отправки", "warning")
+            return
+        self._ask_yes_no("Подтверждение", f"Отправить {len(files)} файл(ов)?",
+                         lambda: threading.Thread(target=self._send_files_thread, args=(files,), daemon=True).start())
+        
+    def get_total_size(paths: list) -> int:
+        total = 0
+        for path in paths:
+            if os.path.isfile(path):
+                total += os.path.getsize(path)
+            elif os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for f in files:
+                        total += os.path.getsize(os.path.join(root, f))
+        return total
+
+    def _send_files_thread(self, paths: List[str]):
+        # Сначала подсчитаем общее количество файлов и размер
+        all_files = []
+        total_size = 0
+        self._show_progress(True, "Подсчёт файлов...")
+        for path in paths:
+            if os.path.isfile(path):
+                all_files.append(path)
+                total_size += os.path.getsize(path)
+            else:
+                for root, _, files in os.walk(path):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        all_files.append(fp)
+                        total_size += os.path.getsize(fp)
+        total_files = len(all_files)
+
+        sent_bytes = 0
+        self._show_progress(True, f"Отправка {total_files} файл(ов) ({format_size(total_size)})...")
+        for i, file in enumerate(all_files):
+            # формируем путь на устройстве
+            relative = os.path.relpath(file, start=os.path.commonpath(paths))
+            remote_path = f"{self.current_android_path.rstrip('/')}/{relative.replace(os.sep, '/')}"
+            success = self.adb.push_file(file, remote_path)
+            if success:
+                sent_bytes += os.path.getsize(file)
+                progress = (sent_bytes / total_size * 100) if total_size > 0 else (i + 1) / total_files * 100
+                GLib.idle_add(lambda p=progress, sb=sent_bytes, ts=total_size, tf=total_files, idx=i: self._update_progress(p, f"Отправка {idx+1}/{tf} ({format_size(sb)} / {format_size(ts)})"))
+                GLib.idle_add(lambda f=file: self.log(f"{os.path.basename(f)} отправлен", "success"))
+            else:
+                GLib.idle_add(lambda f=file: self.log(f"Ошибка при отправке {os.path.basename(f)}", "error"))
+        self._show_progress(False)
+
+    def _delete_local_files(self):
+        selection = self.local_view.get_selection()
+        files = [path for is_dir, path in selection if path != "parent"]
+        if not files:
+            return
+        self._ask_yes_no("Подтверждение", f"Удалить {len(files)} файл(ов)?\n{Config.Messages.CONFIRM_DELETE}",
+                         self._delete_local_files_thread, files)
+
+    def _delete_local_files_thread(self, files):
+        for file in files:
+            try:
+                if os.path.isfile(file):
+                    os.remove(file)
+                elif os.path.isdir(file):
+                    shutil.rmtree(file)
+                GLib.idle_add(lambda f=os.path.basename(file): self.log(f"{f} удалён", "success"))
+            except Exception as e:
+                GLib.idle_add(lambda f=os.path.basename(file), err=e: self.log(f"Ошибка при удалении {f}: {err}", "error"))
+                GLib.idle_add(self._update_android_tree)
+
+    def _delete_android_files(self):
+        if not self.adb.device:
+            return
+        selection = self.android_view.get_selection()
+        files = [name for is_dir, name in selection]
+        if not files:
+            return
+        self._ask_yes_no("Подтверждение", f"Удалить {len(files)} файл(ов)?\n{Config.Messages.CONFIRM_DELETE}",
+                         lambda: threading.Thread(target=self._delete_android_files_thread, args=(files,), daemon=True).start())
+
+    def _delete_android_files_thread(self, files: List[str]):
+        for file in files:
+            try:
+                remote_path = f"{self.current_android_path.rstrip('/')}/{file}"
+                success = self.adb.delete_file(remote_path)
+                if success:
+                    GLib.idle_add(lambda f=file: self.log(f"{f} удалён", "success"))
+                else:
+                    GLib.idle_add(lambda f=file: self.log(f"Ошибка при удалении {f}", "error"))
+            except Exception as e:
+                GLib.idle_add(lambda f=file, err=e: self.log(f"Ошибка при удалении {f}: {err}", "error"))
+        GLib.idle_add(self._load_android_files)
+
+    def _rename_local_item(self):
+        selection = self.local_view.get_selection()
+        if not selection or selection[0][1] == "parent":
+            return
+        _, path = selection[0]
+        old_name = os.path.basename(path)
+        self._rename_dialog("Переименовать", old_name,
+                            lambda new_name: self._rename_local_file(path, new_name))
+
+    def _rename_local_file(self, old_path, new_name):
+        if not new_name:
+            return
+        parent = os.path.dirname(old_path)
+        new_path = os.path.join(parent, new_name)
+        try:
+            os.rename(old_path, new_path)
+            self.log(f"Переименовано: {os.path.basename(old_path)} -> {new_name}", "success")
+            self._load_local_files()
+        except Exception as e:
+            self.log(f"Ошибка при переименовании: {e}", "error")
+
+    def _rename_android_item(self):
+        if not self.adb.device:
+            return
+        selection = self.android_view.get_selection()
+        if not selection:
+            return
+        _, name = selection[0]
+        self._rename_dialog("Переименовать", name,
+                            lambda new_name: self._rename_android_file(name, new_name))
+
+    def _rename_android_file(self, old_name, new_name):
+        if not new_name:
+            return
+        old_full = f"{self.current_android_path.rstrip('/')}/{old_name}"
+        new_full = f"{self.current_android_path.rstrip('/')}/{new_name}"
+        self._show_progress(True, "Переименование...")
+        def rename_thread():
+            success = self.adb.rename_file(old_full, new_full)
+            GLib.idle_add(self._show_progress, False)
+            if success:
+                GLib.idle_add(lambda: self.log(f"Переименовано: {old_name} -> {new_name}", "success"))
+                GLib.idle_add(self._load_android_files)
+            else:
+                GLib.idle_add(lambda: self.log("Ошибка при переименовании", "error"))
+        threading.Thread(target=rename_thread, daemon=True).start()
+
+    def _create_android_folder(self):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        dialog = Adw.MessageDialog.new(self.window, "Создание папки", f"Создать папку в:\n{self.current_android_path}")
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Имя папки")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Отмена")
+        dialog.add_response("create", "Создать")
+        dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda d, resp: self._on_create_folder_response(d, resp, entry.get_text()))
+        dialog.present()
+
+    def _on_create_folder_response(self, dialog, response, folder_name):
+        dialog.destroy()
+        if response == "create" and folder_name.strip():
+            threading.Thread(target=self._create_folder_thread, args=(folder_name.strip(),), daemon=True).start()
+
+    def _create_folder_thread(self, folder_name: str):
+        folder_path = f"{self.current_android_path.rstrip('/')}/{folder_name}"
+        success = self.adb.create_folder(folder_path)
+        if success:
+            GLib.idle_add(lambda: self.log(f"Папка {folder_name} создана", "success"))
+            GLib.idle_add(self._load_android_files)
         else:
-            selection = self.android_view.get_selection()
-            if selection and selection[0][0] == "dir":
-                folder_name = selection[0][1].strip('\'"').strip()
-                current = self.current_android_path.rstrip('/')
-                new_path = f"/{folder_name}" if current == "/" else f"{current}/{folder_name}"
-                self.current_android_path = normalize_android_path(new_path)
-                self._load_android_files()
+            GLib.idle_add(lambda: self.log("Ошибка при создании папки", "error"))
+
+    def _install_single_apk(self, apk_path: str):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        self._ask_yes_no("Подтверждение", f"Установить {os.path.basename(apk_path)}?",
+                         lambda: threading.Thread(target=self._install_apks_thread, args=([apk_path],), daemon=True).start())
+
+    def _install_apk_from_device(self, apk_name: str):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        remote_path = f"{self.current_android_path.rstrip('/')}/{apk_name}"
+        local_temp = os.path.join(self.current_local_path, f"temp_{apk_name}")
+        self._ask_yes_no("Подтверждение", f"Скачать и установить {apk_name}?",
+                         lambda: threading.Thread(target=self._install_from_device_thread, args=(remote_path, local_temp, apk_name), daemon=True).start())
+
+    def _install_from_device_thread(self, remote_path: str, local_temp: str, apk_name: str):
+        try:
+            self._show_progress(True, f"Скачивание {apk_name}...")
+            if not self.adb.pull_file(remote_path, local_temp):
+                GLib.idle_add(lambda: self.log(f"Ошибка при скачивании {apk_name}", "error"))
+                self._show_progress(False)
+                return
+            self._update_progress(50)
+            self._show_progress(True, f"Установка {apk_name}...")
+            success, message = self.adb.install_apk(local_temp)
+            if success:
+                GLib.idle_add(lambda: self.log(f"{apk_name} установлен", "success"))
+            else:
+                GLib.idle_add(lambda: self.log(f"Ошибка при установке {apk_name}: {message}", "error"))
+            try:
+                os.remove(local_temp)
+            except:
+                pass
+            self._show_progress(False)
+        except Exception as e:
+            GLib.idle_add(lambda: self.log(f"Ошибка при установке {apk_name}: {e}", "error"))
+            self._show_progress(False)
+
+    def _install_apks_thread(self, apk_files: List[str]):
+        total = len(apk_files)
+        for i, apk_file in enumerate(apk_files):
+            try:
+                self._show_progress(True, f"Установка {os.path.basename(apk_file)} ({i+1}/{total})")
+                if not apk_file.lower().endswith('.apk'):
+                    GLib.idle_add(lambda f=apk_file: self.log(f"{os.path.basename(f)} не является APK", "error"))
+                    continue
+                success, message = self.adb.install_apk(apk_file)
+                if success:
+                    GLib.idle_add(lambda f=apk_file: self.log(f"{os.path.basename(f)} установлен", "success"))
+                else:
+                    GLib.idle_add(lambda f=apk_file, m=message: self.log(f"Ошибка при установке {os.path.basename(f)}: {m}", "error"))
+                self._update_progress((i + 1) / total * 100)
+            except Exception as e:
+                GLib.idle_add(lambda f=apk_file, err=e: self.log(f"Ошибка при установке {os.path.basename(f)}: {err}", "error"))
+        self._show_progress(False)
+
+    def _show_scrcpy_dialog(self, action=None, param=None):
+        if not self.adb.device:
+            self.log("Нет подключенного устройства", "error")
+            return
+        try:
+            subprocess.run(["scrcpy", "--version"], capture_output=True, check=True, timeout=5)
+        except:
+            dialog = Adw.MessageDialog.new(
+                self.window, "Scrcpy не найден",
+                "Хотите скачать его?"
+            )
+            dialog.add_response("cancel", "Отмена")
+            dialog.add_response("download", "Скачать")
+            dialog.set_response_appearance("download", Adw.ResponseAppearance.SUGGESTED)
+            dialog.connect("response", lambda d, r: webbrowser.open("https://github.com/Genymobile/scrcpy/releases") if r == "download" else None)
+            dialog.present()
+            return
+        try:
+            subprocess.Popen(["scrcpy", "-s", self.adb.device])
+            self.log(f"Scrcpy запущен для устройства {self.adb.device}", "success")
+        except Exception as e:
+            self.log(f"Ошибка при запуске scrcpy: {e}", "error")
+
+    def _check_for_updates(self, action=None, param=None):
+        threading.Thread(target=self._check_updates_thread, daemon=True).start()
+
+    def _check_updates_thread(self):
+        try:
+            GLib.idle_add(lambda: self.log("Проверка обновлений...", "info"))
+            response = requests.get(
+                f"https://api.github.com/repos/{Config.GITHUB_REPO}/releases/latest",
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                latest_version = data.get("tag_name", "").lstrip("v")
+                current = Config.CURRENT_VERSION
+                if latest_version > current:
+                    GLib.idle_add(lambda: self._show_update_dialog(data))
+                else:
+                    GLib.idle_add(lambda: self.log("У вас последняя версия", "success"))
+            else:
+                GLib.idle_add(lambda: self.log("Не удалось проверить обновления", "error"))
+        except Exception:
+            GLib.idle_add(lambda: self.log("Ошибка при проверке обновлений", "error"))
+
+    def _show_update_dialog(self, release_data):
+        dialog = Adw.MessageDialog.new(
+            self.window,
+            f"Доступна новая версия {release_data['tag_name']}",
+            release_data.get("body", "Нет описания")
+        )
+        dialog.add_response("cancel", "Позже")
+        dialog.add_response("download", "Скачать")
+        dialog.set_response_appearance("download", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda d, r: webbrowser.open(release_data["html_url"]) if r == "download" else None)
+        dialog.present()
+
+    def _show_info_window(self, action, param):
+        InfoWindow(self.window)
 
     def _local_navigate_up(self):
         parent = os.path.dirname(self.current_local_path)
@@ -410,711 +774,231 @@ class ADBFileManager:
         parent = os.path.dirname(current)
         if not parent or parent == current:
             parent = "/storage/emulated/0"
-
         if parent == "/storage/emulated":
-            messagebox.showwarning(
-                "Ограничение доступа",
+            dialog = Adw.MessageDialog.new(
+                self.window, "Ограничение доступа",
                 "Google идет по пути ограничения свободы Android.\n"
-                "Получить доступ к корневой папке невозможно :("
+                "Получить доступ к корневой папке невозможно."
             )
+            dialog.add_response("ok", "OK")
+            dialog.present()
             self.current_android_path = Config.ANDROID_HOME
         else:
             self.current_android_path = parent
-
         self._load_android_files()
 
     def _android_go_home(self):
         self.current_android_path = Config.ANDROID_HOME
         self._load_android_files()
 
-    def _show_local_context_menu(self, event):
-        item = self.local_view.tree.identify_row(event.y)
-        if not item:
-            return
-        self.local_view.tree.selection_set(item)
-        menu = tk.Menu(self.root, tearoff=0)
-
-        selection = self.local_view.get_selection()
-        if not selection:
-            return
-
-        tag, path = selection[0]
-
-        if tag == "parent":
-            menu.add_command(label="📂 Открыть", command=self._local_navigate_up)
-            menu.add_separator()
-            menu.add_command(label="🔄 Обновить", command=lambda: self._load_local_files())
+    # ---------------------- UI helpers ----------------------
+    def _show_progress(self, show: bool, text: str = ""):
+        if show:
+            self.progress_label.set_text(text)
+            self.progress_bar.set_fraction(0)
+            self.progress_bar.show()
+            self.progress_label.show()
         else:
-            is_dir = tag == "dir"
-            if is_dir:
-                menu.add_command(label="📂 Открыть", command=lambda: self._load_local_files(path))
-            else:
-                menu.add_command(label="📄 Открыть", state="disabled")
+            self.progress_bar.set_fraction(0)
+            self.progress_bar.hide()
+            self.progress_label.set_text("")
+            self.progress_label.hide()
 
-            menu.add_command(label="✏️ Переименовать", command=self._rename_local_item)
+    def _update_progress(self, value: float, text: str = None):
+        self.progress_bar.set_fraction(value / 100)
+        if text is not None:
+            self.progress_label.set_text(text)
 
-            if path.lower().endswith('.apk'):
-                menu.add_command(label="📱 Установить APK", command=lambda: self._install_single_apk(path))
+    def log(self, message: str, tag: str = None):
+        if tag == "success":
+            message = f"✓ {message}"
+        elif tag == "error":
+            message = f"✗ {message}"
+        elif tag == "warning":
+            message = f"⚠ {message}"
+        elif tag == "command":
+            message = f"> {message}"
+        elif tag == "info":
+            message = f"ℹ {message}"
+        self.log_buffer.insert(self.log_buffer.get_end_iter(), message + "\n")
+        # прокрутка вниз
+        self.log_textview.scroll_to_mark(self.log_buffer.get_insert(), 0, True, 0, 0)
 
-            menu.add_command(label="📤 Отправить на Android", command=self._send_files)
-            menu.add_separator()
-            menu.add_command(label="🗑️ Удалить", command=self._delete_local_files)
-            menu.add_separator()
-            menu.add_command(label="🔄 Обновить", command=lambda: self._load_local_files())
+    def clear_log(self, widget=None):
+        self.log_buffer.set_text("")
 
-        menu.post(event.x_root, event.y_root)
+    def copy_log_to_clipboard(self, widget=None):
+        start = self.log_buffer.get_start_iter()
+        end = self.log_buffer.get_end_iter()
+        text = self.log_buffer.get_text(start, end, False)
+        clipboard = self.window.get_clipboard()
+        clipboard.set(text)
 
-    def _show_android_context_menu(self, event):
-        if not self.adb.device:
-            return
-        item = self.android_view.tree.identify_row(event.y)
-        if not item:
-            return
-        self.android_view.tree.selection_set(item)
-        menu = tk.Menu(self.root, tearoff=0)
+    def save_log_to_file(self, widget=None):
+        dialog = Gtk.FileChooserNative.new(
+            "Сохранить лог",
+            self.window,
+            Gtk.FileChooserAction.SAVE,
+            "Сохранить",
+            "Отмена"
+        )
+        dialog.set_current_name("adb_log.txt")
+        dialog.connect("response", self._save_log_response)
+        dialog.show()
 
-        selection = self.android_view.get_selection()
-        if not selection:
-            return
-
-        tag, name = selection[0]
-
-        if tag == "dir":
-            menu.add_command(label="📂 Открыть папку", command=lambda: self._on_android_double_click(None))
-            menu.add_command(label="📥 Скачать папку", command=self._pull_files)
-        else:
-            menu.add_command(label="📥 Скачать файл", command=self._pull_files)
-            if name.lower().endswith('.apk'):
-                menu.add_command(label="📱 Установить APK", command=lambda: self._install_apk_from_device(name))
-
-        menu.add_command(label="✏️ Переименовать", command=self._rename_android_item)
-        menu.add_separator()
-        menu.add_command(label="🗑️ Удалить", command=self._delete_android_files)
-        menu.add_separator()
-        menu.add_command(label="📁 Создать папку здесь", command=self._create_android_folder)
-        menu.add_command(label="🔄 Обновить", command=self._load_android_files)
-
-        menu.post(event.x_root, event.y_root)
-
-    def _send_files(self):
-        if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
-            return
-        files = [path for _, path in self.local_view.get_selection() if path != "parent"]
-        if not files:
-            messagebox.showinfo("Информация", "Выберите файлы для отправки")
-            return
-        if messagebox.askyesno("Подтверждение", f"Отправить {len(files)} файл(ов)?"):
-            threading.Thread(target=self._send_files_thread, args=(files,), daemon=True).start()
-
-    def _send_files_thread(self, files: List[str]):
-        self._show_progress(True, "Отправка файлов...")
-        for i, file in enumerate(files):
+    def _save_log_response(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            filename = dialog.get_file().get_path()
             try:
-                success = self.adb.push_file(file, self.current_android_path)
-                basename = os.path.basename(file)
-                if success:
-                    self.root.after(0, lambda f=basename: self.log(f"✓ {f} отправлен", "success"))
-                else:
-                    self.root.after(0, lambda f=basename: self.log(f"✗ Ошибка при отправке {f}", "error"))
-                self._update_progress((i + 1) / len(files) * 100)
+                start = self.log_buffer.get_start_iter()
+                end = self.log_buffer.get_end_iter()
+                text = self.log_buffer.get_text(start, end, False)
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.log(f"Лог сохранён в {filename}", "success")
             except Exception as e:
-                self.root.after(0, lambda f=basename, err=e: self.log(f"✗ Ошибка при отправке {f}: {err}", "error"))
-        self._show_progress(False)
-        self.root.after(500, self._load_android_files)
-
-    def _pull_files(self):
-        if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
-            return
-        files = [name for _, name in self.android_view.get_selection()]
-        if not files:
-            messagebox.showinfo("Информация", "Выберите файлы для скачивания")
-            return
-        if messagebox.askyesno("Подтверждение", f"Скачать {len(files)} файл(ов)?"):
-            threading.Thread(target=self._pull_files_thread, args=(files,), daemon=True).start()
-
-    def _pull_files_thread(self, files: List[str]):
-        self._show_progress(True, "Скачивание файлов...")
-        for i, file in enumerate(files):
-            try:
-                remote_path = f"{self.current_android_path.rstrip('/')}/{file}"
-                success = self.adb.pull_file(remote_path, self.current_local_path)
-                if success:
-                    self.root.after(0, lambda f=file: self.log(f"✓ {f} скачан", "success"))
-                else:
-                    self.root.after(0, lambda f=file: self.log(f"✗ Ошибка при скачивании {f}", "error"))
-                self._update_progress((i + 1) / len(files) * 100)
-            except Exception as e:
-                self.root.after(0, lambda f=file, err=e: self.log(f"✗ Ошибка при скачивании {f}: {err}", "error"))
-        self._show_progress(False)
-        self.root.after(500, self._load_local_files)
-
-    def _delete_local_files(self):
-        files = [path for _, path in self.local_view.get_selection() if path != "parent"]
-        if not files:
-            return
-        if messagebox.askyesno("Подтверждение", f"Удалить {len(files)} файл(ов)?\n{Config.Messages.CONFIRM_DELETE}"):
-            for file in files:
-                try:
-                    if os.path.isfile(file):
-                        os.remove(file)
-                    elif os.path.isdir(file):
-                        shutil.rmtree(file)
-                    self.log(f"✓ {os.path.basename(file)} удалён", "success")
-                except Exception as e:
-                    self.log(f"✗ Ошибка при удалении {os.path.basename(file)}: {e}", "error")
-            self._load_local_files()
-
-    def _delete_android_files(self):
-        if not self.adb.device:
-            return
-        files = [name for _, name in self.android_view.get_selection()]
-        if not files:
-            return
-        if messagebox.askyesno("Подтверждение", f"Удалить {len(files)} файл(ов)?\n{Config.Messages.CONFIRM_DELETE}"):
-            threading.Thread(target=self._delete_android_files_thread, args=(files,), daemon=True).start()
-
-    def _delete_android_files_thread(self, files: List[str]):
-        for file in files:
-            try:
-                remote_path = f"{self.current_android_path.rstrip('/')}/{file}"
-                success = self.adb.delete_file(remote_path)
-                if success:
-                    self.root.after(0, lambda f=file: self.log(f"✓ {f} удалён", "success"))
-                else:
-                    self.root.after(0, lambda f=file: self.log(f"✗ Ошибка при удалении {f}", "error"))
-            except Exception as e:
-                self.root.after(0, lambda f=file, err=e: self.log(f"✗ Ошибка при удалении {f}: {err}", "error"))
-        self.root.after(500, self._load_android_files)
-
-    def _rename_local_item(self):
-        selection = self.local_view.get_selection()
-        if not selection or selection[0][0] == "parent":
-            return
-        _, path = selection[0]
-        old_name = os.path.basename(path)
-        parent_dir = os.path.dirname(path)
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Переименование")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text=f"Переименовать:\n{old_name}").pack(pady=10)
-
-        frame = ttk.Frame(dialog)
-        frame.pack(pady=10)
-        ttk.Label(frame, text="Новое имя:").pack(side=tk.LEFT, padx=(0, 5))
-        new_name_entry = ttk.Entry(frame, width=30)
-        new_name_entry.pack(side=tk.LEFT)
-        new_name_entry.insert(0, old_name)
-        new_name_entry.select_range(0, tk.END)
-        new_name_entry.focus()
-
-        def rename():
-            new_name = new_name_entry.get().strip()
-            if not new_name:
-                messagebox.showwarning("Предупреждение", "Введите новое имя")
-                return
-            if new_name == old_name:
-                dialog.destroy()
-                return
-            new_path = os.path.join(parent_dir, new_name)
-            try:
-                os.rename(path, new_path)
-                self.log(f"✓ Переименовано: {old_name} -> {new_name}", "success")
-                self._load_local_files()
-                dialog.destroy()
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось переименовать: {e}")
-
-        ttk.Button(dialog, text="Переименовать", command=rename).pack(pady=10)
-        dialog.bind('<Return>', lambda e: rename())
-
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-    def _rename_android_item(self):
-        if not self.adb.device:
-            return
-        selection = self.android_view.get_selection()
-        if not selection or selection[0][0] == "parent":
-            return
-        _, name = selection[0]
-        old_name = name
-        current_path = self.current_android_path.rstrip('/')
-        old_full_path = f"{current_path}/{old_name}"
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Переименование")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text=f"Переименовать:\n{old_name}").pack(pady=10)
-
-        frame = ttk.Frame(dialog)
-        frame.pack(pady=10)
-        ttk.Label(frame, text="Новое имя:").pack(side=tk.LEFT, padx=(0, 5))
-        new_name_entry = ttk.Entry(frame, width=30)
-        new_name_entry.pack(side=tk.LEFT)
-        new_name_entry.insert(0, old_name)
-        new_name_entry.select_range(0, tk.END)
-        new_name_entry.focus()
-
-        def rename():
-            new_name = new_name_entry.get().strip()
-            if not new_name:
-                messagebox.showwarning("Предупреждение", "Введите новое имя")
-                return
-            if new_name == old_name:
-                dialog.destroy()
-                return
-            new_full_path = f"{current_path}/{new_name}"
-
-            def rename_thread():
-                self._show_progress(True, "Переименование...")
-                success = self.adb.rename_file(old_full_path, new_full_path)
-                if success:
-                    self.root.after(0, lambda: self.log(f"✓ Переименовано: {old_name} -> {new_name}", "success"))
-                    self.root.after(500, self._load_android_files)
-                else:
-                    self.root.after(0, lambda: self.log(f"✗ Ошибка при переименовании", "error"))
-                self._show_progress(False)
-                dialog.destroy()
-
-            threading.Thread(target=rename_thread, daemon=True).start()
-
-        ttk.Button(dialog, text="Переименовать", command=rename).pack(pady=10)
-        dialog.bind('<Return>', lambda e: rename())
-
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-    def _create_android_folder(self):
-        if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
-            return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Создание папки")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text=f"Создать папку в:\n{self.current_android_path}").pack(pady=10)
-
-        frame = ttk.Frame(dialog)
-        frame.pack(pady=10)
-        ttk.Label(frame, text="Имя папки:").pack(side=tk.LEFT, padx=(0, 5))
-        folder_name = ttk.Entry(frame, width=30)
-        folder_name.pack(side=tk.LEFT)
-        folder_name.focus()
-
-        def create():
-            name = folder_name.get().strip()
-            if name:
-                dialog.destroy()
-                threading.Thread(target=self._create_folder_thread, args=(name,), daemon=True).start()
-            else:
-                messagebox.showwarning("Предупреждение", "Введите имя папки")
-
-        ttk.Button(dialog, text="Создать", command=create).pack(pady=10)
-
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-    def _create_folder_thread(self, folder_name: str):
-        folder_path = f"{self.current_android_path.rstrip('/')}/{folder_name}"
-        success = self.adb.create_folder(folder_path)
-        if success:
-            self.root.after(0, lambda: self.log(f"✓ Папка {folder_name} создана", "success"))
-            self.root.after(500, self._load_android_files)
-        else:
-            self.root.after(0, lambda: self.log(f"✗ Ошибка при создании папки", "error"))
-
-    def _install_single_apk(self, apk_path: str):
-        if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
-            return
-        if messagebox.askyesno("Подтверждение", f"Установить {os.path.basename(apk_path)}?"):
-            threading.Thread(target=self._install_apks_thread, args=([apk_path],), daemon=True).start()
-
-    def _install_apk_from_device(self, apk_name: str):
-        if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
-            return
-        remote_path = f"{self.current_android_path.rstrip('/')}/{apk_name}"
-        local_temp = os.path.join(self.current_local_path, f"temp_{apk_name}")
-
-        if messagebox.askyesno("Подтверждение", f"Скачать и установить {apk_name}?"):
-            threading.Thread(target=self._install_from_device_thread, args=(remote_path, local_temp, apk_name), daemon=True).start()
-
-    def _install_from_device_thread(self, remote_path: str, local_temp: str, apk_name: str):
-        try:
-            self._show_progress(True, f"Скачивание {apk_name}...")
-            if not self.adb.pull_file(remote_path, local_temp):
-                self.root.after(0, lambda: self.log(f"✗ Ошибка при скачивании {apk_name}", "error"))
-                self._show_progress(False)
-                return
-
-            self._update_progress(50)
-            self._show_progress(True, f"Установка {apk_name}...")
-
-            success, message = self.adb.install_apk(local_temp)
-            if success:
-                self.root.after(0, lambda: self.log(f"✓ {apk_name} установлен", "success"))
-            else:
-                self.root.after(0, lambda: self.log(f"✗ Ошибка при установке {apk_name}: {message}", "error"))
-
-            try:
-                os.remove(local_temp)
-            except:
-                pass
-
-            self._show_progress(False)
-
-        except Exception as e:
-            self.root.after(0, lambda: self.log(f"✗ Ошибка при установке {apk_name}: {e}", "error"))
-            self._show_progress(False)
-
-    def _install_apks_thread(self, apk_files: List[str]):
-        total = len(apk_files)
-        for i, apk_file in enumerate(apk_files):
-            try:
-                self._show_progress(True, f"Установка {os.path.basename(apk_file)} ({i+1}/{total})")
-                if not apk_file.lower().endswith('.apk'):
-                    self.root.after(0, lambda f=apk_file: self.log(f"✗ {os.path.basename(f)} не является APK", "error"))
-                    continue
-                success, message = self.adb.install_apk(apk_file)
-                if success:
-                    self.root.after(0, lambda f=apk_file: self.log(f"✓ {os.path.basename(f)} установлен", "success"))
-                else:
-                    self.root.after(0, lambda f=apk_file, m=message: self.log(f"✗ Ошибка при установке {os.path.basename(f)}: {m}", "error"))
-                self._update_progress((i + 1) / total * 100)
-            except Exception as e:
-                self.root.after(0, lambda f=apk_file, err=e: self.log(f"✗ Ошибка при установке {os.path.basename(f)}: {err}", "error"))
-        self._show_progress(False)
-
-    def _show_scrcpy_dialog(self):
-        if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
-            return
-
-        try:
-            subprocess.run(["scrcpy", "--version"], capture_output=True, check=True, timeout=5)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            result = messagebox.askyesno(
-                "Scrcpy не найден",
-                "Scrcpy не установлен. Хотите скачать его?"
-            )
-            if result:
-                webbrowser.open("https://github.com/Genymobile/scrcpy/releases")
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Настройки scrcpy")
-        dialog.geometry("450x500")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        main_frame = ttk.Frame(dialog, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        audio_frame = ttk.LabelFrame(main_frame, text="Настройки звука", padding="10")
-        audio_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(audio_frame, text="Источник звука:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        audio_source = ttk.Combobox(audio_frame, values=["playback (системный)", "none (без звука)"],
-                                     state="readonly", width=25)
-        audio_source.grid(row=0, column=1, padx=5, pady=2)
-        audio_source.current(0)
-
-        ttk.Label(audio_frame, text="Кодек:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        audio_codec = ttk.Combobox(audio_frame, values=["aac", "opus", "raw"],
-                                    state="readonly", width=25)
-        audio_codec.grid(row=1, column=1, padx=5, pady=2)
-        audio_codec.current(0)
-
-        ttk.Label(audio_frame, text="Битрейт:").grid(row=2, column=0, sticky=tk.W, pady=2)
-        audio_bitrate = ttk.Combobox(audio_frame, values=["64K", "128K", "192K", "256K"],
-                                      state="readonly", width=25)
-        audio_bitrate.grid(row=2, column=1, padx=5, pady=2)
-        audio_bitrate.current(1)
-
-        video_frame = ttk.LabelFrame(main_frame, text="Настройки видео", padding="10")
-        video_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(video_frame, text="Макс. разрешение:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        max_size = ttk.Combobox(video_frame, values=["1024", "1280", "1920", "2560", "оригинал"],
-                                 state="readonly", width=25)
-        max_size.grid(row=0, column=1, padx=5, pady=2)
-        max_size.current(2)
-
-        ttk.Label(video_frame, text="Битрейт видео:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        video_bitrate = ttk.Combobox(video_frame, values=["2M", "4M", "8M", "16M", "32M"],
-                                      state="readonly", width=25)
-        video_bitrate.grid(row=1, column=1, padx=5, pady=2)
-        video_bitrate.current(2)
-
-        options_frame = ttk.LabelFrame(main_frame, text="Дополнительно", padding="10")
-        options_frame.pack(fill=tk.X, pady=(0, 10))
-
-        stay_awake = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options_frame, text="Не выключать экран", variable=stay_awake).pack(anchor=tk.W, pady=2)
-
-        turn_screen_off = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options_frame, text="Выключить экран телефона", variable=turn_screen_off).pack(anchor=tk.W, pady=2)
-
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=(10, 0))
-
-        def launch():
-            device_serial = self.adb.device
-            params = ["scrcpy", "-s", device_serial]
-
-            source = audio_source.get().split()[0]
-            if source != "none":
-                params.extend(["--audio-source", source])
-                params.extend(["--audio-codec", audio_codec.get()])
-                params.extend(["--audio-bit-rate", audio_bitrate.get()])
-
-            if max_size.get() != "оригинал":
-                params.extend(["--max-size", max_size.get()])
-            params.extend(["--video-bit-rate", video_bitrate.get()])
-
-            if stay_awake.get():
-                params.append("--stay-awake")
-            if turn_screen_off.get():
-                params.append("--turn-screen-off")
-
-            dialog.destroy()
-            try:
-                subprocess.Popen(params)
-                self.log(f"✓ Scrcpy запущен для устройства {device_serial}", "success")
-            except Exception as e:
-                self.log(f"✗ Ошибка при запуске scrcpy: {e}", "error")
-
-        ttk.Button(button_frame, text="Запустить", command=launch, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Отмена", command=dialog.destroy, width=15).pack(side=tk.LEFT, padx=5)
-
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-    def _check_for_updates(self):
-        threading.Thread(target=self._check_updates_thread, daemon=True).start()
-
-    def _check_updates_thread(self):
-        try:
-            self.root.after(0, lambda: self.log("🔍 Проверка обновлений...", "info"))
-            response = requests.get(
-                f"https://api.github.com/repos/{Config.GITHUB_REPO}/releases/latest",
-                timeout=5
-            )
-            if response.status_code == 200:
-                data = response.json()
-                latest_version = data.get("tag_name", "").lstrip("v")
-                current = Config.CURRENT_VERSION
-                latest = latest_version
-
-                try:
-                    from packaging import version
-                    has_update = version.parse(latest) > version.parse(current)
-                except ImportError:
-                    has_update = latest > current
-
-                if has_update:
-                    self.root.after(0, lambda: self._show_update_dialog(data))
-                else:
-                    self.root.after(0, lambda: self.log("✓ У вас последняя версия", "success"))
-            else:
-                self.root.after(0, lambda: self.log("✗ Не удалось проверить обновления", "error"))
-        except Exception:
-            self.root.after(0, lambda: self.log("✗ Ошибка при проверке обновлений", "error"))
-
-    def _show_update_dialog(self, release_data):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Доступно обновление")
-        dialog.geometry("500x400")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        main_frame = ttk.Frame(dialog, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(main_frame, text=f"Доступна новая версия {release_data['tag_name']}",
-                  font=('Arial', 12, 'bold')).pack(pady=(0, 10))
-
-        text_frame = ttk.Frame(main_frame)
-        text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        scrollbar = ttk.Scrollbar(text_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        text = tk.Text(text_frame, wrap=tk.WORD, yscrollcommand=scrollbar.set, height=15)
-        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=text.yview)
-
-        text.insert(tk.END, release_data.get("body", "Нет описания"))
-        text.config(state=tk.DISABLED)
-
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=(10, 0))
-
-        def download():
-            webbrowser.open(release_data["html_url"])
-            dialog.destroy()
-
-        def later():
-            dialog.destroy()
-
-        download_btn = ttk.Button(button_frame, text="📥 Скачать", command=download, width=15)
-        download_btn.pack(side=tk.LEFT, padx=5, expand=True)
-
-        later_btn = ttk.Button(button_frame, text="⏰ Позже", command=later, width=15)
-        later_btn.pack(side=tk.LEFT, padx=5, expand=True)
-
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-        dialog.focus_set()
-        dialog.grab_set()
-        dialog.wait_window()
-
-    def _on_adb_command_focus_in(self, event):
-        if self.adb_command.get() == "Введите команду (например: shell ls /sdcard, clear)":
-            self.adb_command.delete(0, tk.END)
-
-    def _on_adb_command_focus_out(self, event):
-        if not self.adb_command.get():
-            self.adb_command.insert(0, "Введите команду (например: shell ls /sdcard, clear)")
+                self.log(f"Ошибка при сохранении лога: {e}", "error")
 
     def _execute_adb_command(self):
-        command = self.adb_command.get().strip()
+        command = self.cmd_entry.get_text().strip()
         if not command:
             return
-
-        if command.lower() in ['clear']:
+        if command.lower() == 'clear':
             self.clear_log()
-            self.adb_command.delete(0, tk.END)
+            self.cmd_entry.set_text("")
             return
-
         if not self.adb.device:
-            messagebox.showerror("Ошибка", Config.Messages.NO_DEVICE)
+            self.log("Нет подключенного устройства", "error")
             return
-
-        self.log(f"> adb -s {self.adb.device} {command}", "command")
-
+        self.log(f"adb -s {self.adb.device} {command}", "command")
         def run():
             stdout, stderr = self.adb.run_command(command)
-            self.root.after(0, lambda: self._show_command_result(stdout, stderr))
-
+            GLib.idle_add(lambda: self._show_command_result(stdout, stderr))
         threading.Thread(target=run, daemon=True).start()
 
     def _show_command_result(self, stdout: str, stderr: str):
         if stdout:
             for line in stdout.split('\n'):
                 if line.strip():
-                    self.log(f"  {line}")
+                    self.log(line)
         if stderr:
-            self.log(f"✗ {stderr}", "error")
+            self.log(stderr, "error")
 
-    def log(self, message: str, tag: str = None):
-        if tag is None:
-            if message.startswith('✓'):
-                tag = "success"
-            elif message.startswith('✗'):
-                tag = "error"
-            elif message.startswith('⚠'):
-                tag = "warning"
-            elif message.startswith('>'):
-                tag = "command"
-            elif message.startswith('📂') or message.startswith('🔍') or message.startswith('📊'):
-                tag = "info"
+    def _rename_dialog(self, title, old_name, callback):
+        dialog = Adw.MessageDialog.new(self.window, title, f"Переименовать:\n{old_name}")
+        entry = Gtk.Entry()
+        entry.set_text(old_name)
+        entry.select_region(0, -1)
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Отмена")
+        dialog.add_response("rename", "Переименовать")
+        dialog.set_response_appearance("rename", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda d, resp: self._on_rename_response(d, resp, entry.get_text(), callback))
+        dialog.present()
 
-        if tag:
-            self.log_text.insert(tk.END, message + "\n", tag)
+    def _on_rename_response(self, dialog, response, new_name, callback):
+        dialog.destroy()
+        if response == "rename" and new_name.strip():
+            callback(new_name.strip())
+
+    def _ask_yes_no(self, title, message, on_yes, *args):
+        dialog = Adw.MessageDialog.new(self.window, title, message)
+        dialog.add_response("no", "Нет")
+        dialog.add_response("yes", "Да")
+        dialog.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        if args:
+            dialog.connect("response", lambda d, resp: on_yes(*args) if resp == "yes" else None)
         else:
-            self.log_text.insert(tk.END, message + "\n")
+            dialog.connect("response", lambda d, resp: on_yes() if resp == "yes" else None)
+        dialog.present()
 
-        self.log_text.see(tk.END)
-        self.log_text.update_idletasks()
+    # ---------------------- Context menus ----------------------
+    def _show_local_context_menu(self, event):
+        selection = self.local_view.get_selection()
+        if not selection:
+            return
+        self._context_selection = selection
 
-    def clear_log(self):
-        self.log_text.delete(1.0, tk.END)
+        menu = Gio.Menu()
+        multiple = len(selection) > 1
+        is_parent = any(path == "parent" for _, path in selection)
 
-    def copy_log_to_clipboard(self):
-        log_content = self.log_text.get(1.0, tk.END)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(log_content)
-        self.log("✓ Лог скопирован в буфер обмена", "success")
-
-    def save_log_to_file(self):
-        filename = filedialog.asksaveasfilename(
-            title="Сохранить лог",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if filename:
-            try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(self.log_text.get(1.0, tk.END))
-                self.log(f"✓ Лог сохранён в {filename}", "success")
-            except Exception as e:
-                self.log(f"✗ Ошибка при сохранении лога: {e}", "error")
-
-    def _show_log_context_menu(self, event):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="📋 Копировать", command=self.copy_selected_log)
-        menu.add_command(label="📋 Копировать всё", command=self.copy_log_to_clipboard)
-        menu.add_separator()
-        menu.add_command(label="🗑️ Очистить", command=self.clear_log)
-        menu.add_separator()
-        menu.add_command(label="💾 Сохранить...", command=self.save_log_to_file)
-        menu.post(event.x_root, event.y_root)
-
-    def copy_selected_log(self):
-        try:
-            selected_text = self.log_text.get(tk.SEL_FIRST, tk.SEL_LAST)
-            self.root.clipboard_clear()
-            self.root.clipboard_append(selected_text)
-        except tk.TclError:
-            pass
-
-    def _show_progress(self, show: bool = True, text: str = ""):
-        if show:
-            self.progress_label.config(text=text)
-            self.progress_label.pack(side=tk.LEFT, padx=(0, 10))
-            self.progress_bar.pack(side=tk.LEFT)
-            self.progress_var.set(0)
+        if is_parent:
+            menu.append("Открыть", "app.local.open")
+            menu.append("Обновить", "app.local.refresh")
         else:
-            self.progress_label.pack_forget()
-            self.progress_bar.pack_forget()
+            # если несколько файлов выбрано
+            menu.append("Открыть", "app.local.open")
+            menu.append("Переименовать", "app.local.rename")
+            menu.append("Удалить", "app.local.delete")
+            menu.append("Обновить", "app.local.refresh")
+            # только для одного файла
+            if not multiple:
+                is_dir, path = selection[0]
+                if path.lower().endswith('.apk'):
+                    menu.append("Установить APK", "app.local.install")
+                menu.append("Отправить на Android", "app.local.send")
 
-    def _update_progress(self, value: float):
-        self.progress_var.set(value)
-        self.root.update_idletasks()
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        popover.set_parent(self.local_view.tree)
+        rect = Gdk.Rectangle()
+        rect.x = int(event.x)
+        rect.y = int(event.y)
+        rect.width = 1
+        rect.height = 1
+        popover.set_pointing_to(rect)
+        popover.popup()
 
-    def _show_info_window(self):
-        InfoWindow(self.root)
+    def _show_android_context_menu(self, event):
+        if not self.adb.device:
+            return
+        selection = self.android_view.get_selection()
+        if not selection:
+            return
+        self._context_selection = selection
+
+        menu = Gio.Menu()
+        is_dir, name = selection[0]
+
+        if is_dir:
+            menu.append("Открыть папку", "app.android.open")
+            menu.append("Скачать папку", "app.android.pull")
+        else:
+            menu.append("Скачать на ПК", "app.android.pull")
+            if name.lower().endswith('.apk'):
+                menu.append("Установить APK", "app.android.install")
+
+        menu.append("Переименовать", "app.android.rename")
+        menu.append("Удалить", "app.android.delete")
+        menu.append("Создать папку", "app.android.mkdir")
+        menu.append("Обновить", "app.android.refresh")
+
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        popover.set_parent(self.android_view.tree)
+        rect = Gdk.Rectangle()
+        rect.x = int(event.x)
+        rect.y = int(event.y)
+        rect.width = 1
+        rect.height = 1
+        popover.set_pointing_to(rect)
+        popover.popup()
+
+    def _local_open(self):
+        if self._context_selection:
+            is_dir, path = self._context_selection[0]
+            if is_dir:
+                self._load_local_files(path)
+
+    def _android_open(self):
+        if self._context_selection:
+            is_dir, name = self._context_selection[0]
+            if is_dir:
+                self._on_android_double_click(name)
 
 
 def main():
-    root = tk.Tk()
-    app = ADBFileManager(root)
-    root.mainloop()
-
+    app = ADBFileManager()
+    app.run()
 
 if __name__ == "__main__":
     main()

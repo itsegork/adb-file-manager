@@ -16,9 +16,8 @@ class FileInfo:
 
     @property
     def is_apk(self) -> bool:
-        """Проверка, является ли файл APK."""
         return self.name.lower().endswith('.apk')
-
+    
 @dataclass
 class DeviceInfo:
     model: str = ""
